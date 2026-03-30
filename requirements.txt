@@ -1,4 +1,3 @@
 fastapi
-uvicorn
 gradio_client
 python-dotenv
