@@ -23,18 +23,21 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 # --- HUGGING FACE SPACES ---
 SPACE_TEXT_EMO  = "E-motionAssistant/Space4"
 SPACE_AUDIO_EMO = "E-motionAssistant/Space5"
-SPACE_LLM       = "E-motionAssistant/TherapyEnglish"
+SPACE_LLM       = "E-motionAssistant/TherapyTamil"
 SPACE_TTS       = "E-motionAssistant/Space3"
 
-# --- In-memory user store (replace with a real DB for production) ---
+# --- IN-MEMORY STORE ---
+# users_db handles profile info
 users_db: dict[str, dict] = {}
-
+# chat_sessions handles conversation context: { "session_id": [ {"role": "user", "content": "..."}, ... ] }
+chat_sessions: dict[str, list] = {}
 
 # ── REQUEST MODELS ──────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
+    session_id: str  # Use email or a unique UUID to track the conversation
     message: str
-    language: str = "english"
+    language: str = "tamil"
     type: str = "text"   # "text" or "voice"
 
 class LoginRequest(BaseModel):
@@ -46,27 +49,6 @@ class SignupRequest(BaseModel):
     email: str
     password: str
 
-
-# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {
-        "message": "Emotion Assistant API",
-        "status": "running",
-        "endpoints": {
-            "health": "/api/python",
-            "predict": "/api/python/predict",
-            "signup": "/auth/signup",
-            "login": "/auth/login"
-        }
-    }
-
-@app.get("/api/python")
-def health_check():
-    return {"status": "FastAPI server is running"}
-
-
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 
 @app.post("/auth/signup")
@@ -75,25 +57,17 @@ def signup(body: SignupRequest):
     if email in users_db:
         return {"success": False, "error": "An account with that email already exists."}
     users_db[email] = {"name": body.name, "email": email, "password": body.password}
-    return {
-        "success": True,
-        "user": {"name": body.name, "email": email},
-    }
+    return {"success": True, "user": {"name": body.name, "email": email}}
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
-    # Accept email OR username (email used as key)
     identifier = body.username.strip().lower()
     user = users_db.get(identifier)
     if not user or user["password"] != body.password:
         return {"success": False, "error": "Invalid credentials."}
-    return {
-        "success": True,
-        "user": {"name": user["name"], "email": user["email"]},
-    }
+    return {"success": True, "user": {"name": user["name"], "email": user["email"]}}
 
-
-# ── MAIN AI PIPELINE ──────────────────────────────────────────────────────────
+# ── MAIN AI PIPELINE WITH MEMORY ──────────────────────────────────────────────
 
 @app.post("/api/python/predict")
 def unified_ai_pipeline(body: PredictRequest):
@@ -101,32 +75,47 @@ def unified_ai_pipeline(body: PredictRequest):
         user_input = body.message
         lang       = body.language.lower()
         mode       = body.type
+        sid        = body.session_id
 
-        # STEP 1 — Detect emotion
-        if mode == "text":
-            client_emo    = Client(SPACE_TEXT_EMO, hf_token=HF_TOKEN)
-            emotion_result = client_emo.predict(user_input, api_name="/predict")
-        else:
-            client_emo    = Client(SPACE_AUDIO_EMO, hf_token=HF_TOKEN)
-            emotion_result = client_emo.predict(user_input, api_name="/predict")
+        # 1. RETRIEVE MEMORY
+        if sid not in chat_sessions:
+            chat_sessions[sid] = []
+        
+        # Get last 5 exchanges (10 messages) to keep the prompt efficient
+        history = chat_sessions[sid][-10:]
+        context_string = ""
+        for msg in history:
+            role_label = "User" if msg["role"] == "user" else "Assistant"
+            context_string += f"{role_label}: {msg['content']}\n"
 
-        final_emotion = (
-            emotion_result
-            if isinstance(emotion_result, str)
-            else emotion_result.get("label", "neutral")
-        )
+        # 2. DETECT EMOTION
+        client_emo = Client(SPACE_TEXT_EMO if mode == "text" else SPACE_AUDIO_EMO, hf_token=HF_TOKEN)
+        emotion_result = client_emo.predict(user_input, api_name="/predict")
+        final_emotion = emotion_result if isinstance(emotion_result, str) else emotion_result.get("label", "neutral")
 
-        # STEP 2 — Generate LLM response
-        client_llm         = Client(SPACE_LLM, hf_token=HF_TOKEN)
+        # 3. GENERATE LLM RESPONSE (With Context)
+        client_llm = Client(SPACE_LLM, hf_token=HF_TOKEN)
         client_llm.timeout = 360
-        prompt             = f"Language: {lang}. Detected Emotion: {final_emotion}. User said: {user_input}"
-        llm_reply          = client_llm.predict(prompt, api_name="/chat")
+        
+        # We inject the history directly into the prompt
+        full_prompt = (
+            f"You are a helpful assistant. Language: {lang}. Detected Emotion: {final_emotion}.\n"
+            f"Previous Conversation:\n{context_string}"
+            f"User: {user_input}\n"
+            f"Assistant:"
+        )
+        
+        llm_reply = client_llm.predict(full_prompt, api_name="/chat")
 
-        # STEP 3 — Text-to-speech
-        client_tts     = Client(SPACE_TTS, hf_token=HF_TOKEN)
+        # 4. UPDATE MEMORY
+        chat_sessions[sid].append({"role": "user", "content": user_input})
+        chat_sessions[sid].append({"role": "assistant", "content": llm_reply})
+
+        # 5. TEXT-TO-SPEECH
+        client_tts = Client(SPACE_TTS, hf_token=HF_TOKEN)
         temp_audio_path = client_tts.predict(llm_reply, lang, api_name=f"/{lang}_tts")
 
-        # STEP 4 — Encode audio as base64
+        # 6. ENCODE AUDIO
         audio_base64 = ""
         if temp_audio_path and os.path.exists(temp_audio_path):
             with open(temp_audio_path, "rb") as f:
@@ -141,3 +130,7 @@ def unified_ai_pipeline(body: PredictRequest):
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
