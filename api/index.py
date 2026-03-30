@@ -2,14 +2,17 @@ import os
 import base64
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from gradio_client import Client
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
+# Enable CORS for frontend-backend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,19 +29,17 @@ SPACE_AUDIO_EMO = "E-motionAssistant/Space5"
 SPACE_LLM       = "E-motionAssistant/TherapyTamil"
 SPACE_TTS       = "E-motionAssistant/Space3"
 
-# --- IN-MEMORY STORE ---
-# users_db handles profile info
+# --- IN-MEMORY STORE (Note: Clears on Vercel restart) ---
 users_db: dict[str, dict] = {}
-# chat_sessions handles conversation context: { "session_id": [ {"role": "user", "content": "..."}, ... ] }
 chat_sessions: dict[str, list] = {}
 
 # ── REQUEST MODELS ──────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
-    session_id: str  # Use email or a unique UUID to track the conversation
+    session_id: str
     message: str
     language: str = "tamil"
-    type: str = "text"   # "text" or "voice"
+    type: str = "text"
 
 class LoginRequest(BaseModel):
     username: str
@@ -48,6 +49,17 @@ class SignupRequest(BaseModel):
     name: str
     email: str
     password: str
+
+# ── SERVE HTML FRONTEND ──────────────────────────────────────────────────────
+
+# This is what fixes the {"detail":"Not Found"} error when visiting the main URL
+@app.get("/")
+async def serve_home():
+    # Looks for public/chat.html one level up from the api folder
+    static_file_path = os.path.join(os.path.dirname(__file__), "..", "public", "chat.html")
+    if os.path.exists(static_file_path):
+        return FileResponse(static_file_path)
+    return {"error": "chat.html not found in public folder", "path_searched": static_file_path}
 
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 
@@ -67,7 +79,7 @@ def login(body: LoginRequest):
         return {"success": False, "error": "Invalid credentials."}
     return {"success": True, "user": {"name": user["name"], "email": user["email"]}}
 
-# ── MAIN AI PIPELINE WITH MEMORY ──────────────────────────────────────────────
+# ── MAIN AI PIPELINE ──────────────────────────────────────────────────────────
 
 @app.post("/api/python/predict")
 def unified_ai_pipeline(body: PredictRequest):
@@ -81,7 +93,6 @@ def unified_ai_pipeline(body: PredictRequest):
         if sid not in chat_sessions:
             chat_sessions[sid] = []
         
-        # Get last 5 exchanges (10 messages) to keep the prompt efficient
         history = chat_sessions[sid][-10:]
         context_string = ""
         for msg in history:
@@ -93,11 +104,10 @@ def unified_ai_pipeline(body: PredictRequest):
         emotion_result = client_emo.predict(user_input, api_name="/predict")
         final_emotion = emotion_result if isinstance(emotion_result, str) else emotion_result.get("label", "neutral")
 
-        # 3. GENERATE LLM RESPONSE (With Context)
+        # 3. GENERATE LLM RESPONSE
         client_llm = Client(SPACE_LLM, hf_token=HF_TOKEN)
         client_llm.timeout = 360
         
-        # We inject the history directly into the prompt
         full_prompt = (
             f"You are a helpful assistant. Language: {lang}. Detected Emotion: {final_emotion}.\n"
             f"Previous Conversation:\n{context_string}"
@@ -130,7 +140,3 @@ def unified_ai_pipeline(body: PredictRequest):
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
